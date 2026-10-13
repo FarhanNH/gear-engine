@@ -285,6 +285,13 @@ func (s *Server) policyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Bypass policy evaluation untuk admin-session tokens.
+		tokenName := middleware.TokenNameFromContext(r.Context())
+		if tokenName != nil && strings.HasPrefix(*tokenName, "admin-session") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Tentukan action berdasarkan HTTP method.
 		var action string
 		switch r.Method {
