@@ -47,6 +47,18 @@ type Config struct {
 	// Env: GEAR_RATE_LIMIT_WINDOW, default: 5m
 	RateLimitWindow time.Duration
 
+	// RedisAddr is the address of the shared Redis instance used for rate limiting.
+	// Env: GEAR_REDIS_ADDR, default: localhost:6379
+	RedisAddr string
+
+	// RedisPassword is the optional Redis authentication password.
+	// Env: GEAR_REDIS_PASSWORD
+	RedisPassword string
+
+	// RedisDB is the Redis database number used for rate limiting.
+	// Env: GEAR_REDIS_DB, default: 0
+	RedisDB int
+
 	// SessionTTL is the default TTL for admin session tokens.
 	// Env: GEAR_SESSION_TTL, default: 12h
 	SessionTTL time.Duration
@@ -56,12 +68,22 @@ type Config struct {
 // It returns an error if required variables (GEAR_TLS_CERT, GEAR_TLS_KEY) are missing.
 func Load() (*Config, error) {
 	cfg := &Config{
-		DBPath:          getEnv("GEAR_DB_PATH", "./gear.db"),
-		MasterKeyPath:   getEnv("GEAR_MASTER_KEY_PATH", "./master.key"),
-		TLSCert:         getEnv("GEAR_TLS_CERT", ""),
-		TLSKey:          getEnv("GEAR_TLS_KEY", ""),
-		ListenAddr:      getEnv("GEAR_LISTEN_ADDR", ":8443"),
-		HTTPAddr:        getEnv("GEAR_HTTP_ADDR", ":8080"),
+		DBPath:        getEnv("GEAR_DB_PATH", "./gear.db"),
+		MasterKeyPath: getEnv("GEAR_MASTER_KEY_PATH", "./master.key"),
+		TLSCert:       getEnv("GEAR_TLS_CERT", ""),
+		TLSKey:        getEnv("GEAR_TLS_KEY", ""),
+		ListenAddr:    getEnv("GEAR_LISTEN_ADDR", ":8443"),
+		HTTPAddr:      getEnv("GEAR_HTTP_ADDR", ":8080"),
+		RedisAddr:     getEnv("GEAR_REDIS_ADDR", "localhost:6379"),
+		RedisPassword: getEnv("GEAR_REDIS_PASSWORD", ""),
+	}
+
+	if raw := getEnv("GEAR_REDIS_DB", ""); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			return nil, errors.New("invalid GEAR_REDIS_DB: must be a non-negative integer")
+		}
+		cfg.RedisDB = v
 	}
 
 	// GEAR_CORS_ORIGIN — optional, comma-separated list
@@ -96,6 +118,12 @@ func Load() (*Config, error) {
 		cfg.RateLimitWindow = d
 	} else {
 		cfg.RateLimitWindow = 5 * time.Minute
+	}
+	if cfg.RateLimitMax < 1 {
+		return nil, errors.New("GEAR_RATE_LIMIT_MAX must be greater than zero")
+	}
+	if cfg.RateLimitWindow < time.Microsecond {
+		return nil, errors.New("GEAR_RATE_LIMIT_WINDOW must be at least 1us")
 	}
 
 	// GEAR_SESSION_TTL — optional duration, default 12h

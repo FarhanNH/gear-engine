@@ -1,136 +1,114 @@
 package middleware
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-// ipEntry menyimpan daftar timestamp percobaan login untuk satu IP (sliding window).
-type ipEntry struct {
-	attempts []time.Time
+// LoginRateLimiter atomically checks and records a login attempt for an IP.
+type LoginRateLimiter interface {
+	Allow(ctx context.Context, ip string) (allowed bool, retryAfter int, err error)
 }
 
-// rateLimiter adalah in-memory store per-IP dengan sliding window counter.
-type rateLimiter struct {
-	mu      sync.Mutex
-	entries map[string]*ipEntry
-	max     int
-	window  time.Duration
+// RedisRateLimiter stores login attempts in a Redis sorted set so every
+// application replica shares the same sliding-window counter.
+type RedisRateLimiter struct {
+	client redis.UniversalClient
+	max    int
+	window time.Duration
+	prefix string
 }
 
-// newRateLimiter membuat instance rateLimiter baru dan menjalankan goroutine cleanup.
-func newRateLimiter(max int, window time.Duration) *rateLimiter {
-	rl := &rateLimiter{
-		entries: make(map[string]*ipEntry),
-		max:     max,
-		window:  window,
-	}
-	go rl.cleanupLoop()
-	return rl
-}
-
-// cleanupLoop menjalankan pembersihan entry stale secara berkala untuk mencegah memory leak.
-func (rl *rateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(rl.window)
-	defer ticker.Stop()
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		cutoff := now.Add(-rl.window)
-		for ip, entry := range rl.entries {
-			// Hapus timestamps yang sudah keluar dari window.
-			filtered := entry.attempts[:0]
-			for _, t := range entry.attempts {
-				if t.After(cutoff) {
-					filtered = append(filtered, t)
-				}
-			}
-			if len(filtered) == 0 {
-				delete(rl.entries, ip)
-			} else {
-				entry.attempts = filtered
-			}
-		}
-		rl.mu.Unlock()
+// NewRedisRateLimiter constructs a Redis-backed login rate limiter.
+func NewRedisRateLimiter(client redis.UniversalClient, max int, window time.Duration) *RedisRateLimiter {
+	return &RedisRateLimiter{
+		client: client,
+		max:    max,
+		window: window,
+		prefix: "gear:ratelimit:login:",
 	}
 }
 
-// allow memeriksa apakah IP diizinkan (belum melebihi limit).
-// Jika masih diizinkan, catat percobaan baru dan kembalikan (true, 0).
-// Jika sudah melebihi limit, kembalikan (false, retryAfterSeconds).
-func (rl *rateLimiter) allow(ip string) (allowed bool, retryAfter int) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+// allowScript performs cleanup, limit check, and insertion as one atomic Redis
+// operation. Redis TIME keeps all replicas on the same clock.
+var allowScript = redis.NewScript(`
+local time = redis.call('TIME')
+local now = tonumber(time[1]) * 1000000 + tonumber(time[2])
+local window = tonumber(ARGV[2])
+local cutoff = now - window
 
-	now := time.Now()
-	cutoff := now.Add(-rl.window)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', cutoff)
+local count = redis.call('ZCARD', KEYS[1])
+if count >= tonumber(ARGV[1]) then
+  local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+  local retry = math.ceil((tonumber(oldest[2]) + window - now) / 1000000)
+  if retry < 1 then retry = 1 end
+  return {0, retry}
+end
 
-	entry, ok := rl.entries[ip]
-	if !ok {
-		entry = &ipEntry{}
-		rl.entries[ip] = entry
+redis.call('ZADD', KEYS[1], now, ARGV[3])
+redis.call('PEXPIRE', KEYS[1], math.ceil(window / 1000))
+return {1, 0}
+`)
+
+// Allow returns whether the request is within the configured sliding window.
+func (rl *RedisRateLimiter) Allow(ctx context.Context, ip string) (bool, int, error) {
+	var memberBytes [16]byte
+	if _, err := rand.Read(memberBytes[:]); err != nil {
+		return false, 0, fmt.Errorf("generate rate limit member: %w", err)
 	}
 
-	// Hapus entri yang sudah keluar dari sliding window.
-	filtered := entry.attempts[:0]
-	for _, t := range entry.attempts {
-		if t.After(cutoff) {
-			filtered = append(filtered, t)
-		}
+	keyHash := sha256.Sum256([]byte(ip))
+	key := rl.prefix + hex.EncodeToString(keyHash[:])
+	result, err := allowScript.Run(
+		ctx,
+		rl.client,
+		[]string{key},
+		int64(rl.max),
+		rl.window.Microseconds(),
+		hex.EncodeToString(memberBytes[:]),
+	).Int64Slice()
+	if err != nil {
+		return false, 0, fmt.Errorf("check Redis rate limit: %w", err)
 	}
-	entry.attempts = filtered
-
-	if len(entry.attempts) >= rl.max {
-		// Hitung Retry-After: saat entry tertua keluar dari window.
-		oldest := entry.attempts[0]
-		retryAt := oldest.Add(rl.window)
-		secs := int(time.Until(retryAt).Seconds()) + 1
-		if secs < 1 {
-			secs = 1
-		}
-		return false, secs
+	if len(result) != 2 {
+		return false, 0, fmt.Errorf("unexpected Redis rate limit response length %d", len(result))
 	}
-
-	// Catat percobaan baru.
-	entry.attempts = append(entry.attempts, now)
-	return true, 0
+	return result[0] == 1, int(result[1]), nil
 }
 
-// extractClientIP mengekstrak IP klien dari request dengan prioritas:
-// 1) X-Real-IP header
-// 2) X-Forwarded-For header (IP pertama dalam list)
-// 3) r.RemoteAddr (strip port)
-//
-// Validasi: hanya menerima header proxy jika nilainya berupa IP valid untuk
-// menghindari spoofing dengan nilai sembarang.
+// extractClientIP extracts the client IP, preferring proxy headers only when
+// the header value is a valid IP address.
 func extractClientIP(r *http.Request) string {
-	// 1. X-Real-IP (biasanya di-set oleh nginx secara tepercaya)
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
 			return ip.String()
 		}
 	}
 
-	// 2. X-Forwarded-For — ambil IP pertama (client IP), validasi format.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Format: "client, proxy1, proxy2"
 		parts := strings.Split(xff, ",")
 		if len(parts) > 0 {
-			candidate := strings.TrimSpace(parts[0])
-			if ip := net.ParseIP(candidate); ip != nil {
+			if ip := net.ParseIP(strings.TrimSpace(parts[0])); ip != nil {
 				return ip.String()
 			}
 		}
 	}
 
-	// 3. Fallback ke RemoteAddr, strip port.
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		// RemoteAddr tanpa port (edge case)
 		if ip := net.ParseIP(r.RemoteAddr); ip != nil {
 			return ip.String()
 		}
@@ -139,40 +117,28 @@ func extractClientIP(r *http.Request) string {
 	return host
 }
 
-// RateLimitMiddleware mengembalikan middleware yang membatasi percobaan login per IP
-// menggunakan algoritma sliding window in-memory.
-//
-// Hanya berlaku untuk path yang mengandung "/v1/auth/login".
-// Request yang melebihi limit akan menerima HTTP 429 dengan header Retry-After.
-//
-// Parameter:
-//   - max: jumlah maksimum percobaan per window per IP
-//   - window: durasi sliding window
-//
-// Konfigurasi via env var: GEAR_RATE_LIMIT_MAX dan GEAR_RATE_LIMIT_WINDOW
-//
-// Validates: Requirements 3.4
-func RateLimitMiddleware(max int, window time.Duration) func(http.Handler) http.Handler {
-	rl := newRateLimiter(max, window)
-
+// RateLimitMiddleware limits login attempts per IP using a shared limiter.
+// Requests above the limit receive HTTP 429 and a Retry-After header. If the
+// shared limiter is unavailable, login fails closed with HTTP 503.
+func RateLimitMiddleware(limiter LoginRateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Hanya rate-limit path login.
 			if !strings.Contains(r.URL.Path, "/v1/auth/login") {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			ip := extractClientIP(r)
-			allowed, retryAfter := rl.allow(ip)
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			allowed, retryAfter, err := limiter.Allow(ctx, extractClientIP(r))
+			if err != nil {
+				log.Printf("WARN: login rate limiter unavailable: %v", err)
+				writeRateLimitError(w, http.StatusServiceUnavailable, "rate limiter unavailable", 0)
+				return
+			}
 			if !allowed {
-				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("Retry-After", itoa(retryAfter))
-				w.WriteHeader(http.StatusTooManyRequests)
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"error":       "too many requests",
-					"retry_after": retryAfter,
-				})
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				writeRateLimitError(w, http.StatusTooManyRequests, "too many requests", retryAfter)
 				return
 			}
 
@@ -181,23 +147,12 @@ func RateLimitMiddleware(max int, window time.Duration) func(http.Handler) http.
 	}
 }
 
-// itoa mengkonversi int ke string tanpa import strconv tambahan
-// (dipakai untuk set header Retry-After).
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+func writeRateLimitError(w http.ResponseWriter, status int, message string, retryAfter int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	response := map[string]any{"error": message}
+	if retryAfter > 0 {
+		response["retry_after"] = retryAfter
 	}
-	buf := make([]byte, 0, 10)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		buf = append([]byte{byte('0' + n%10)}, buf...)
-		n /= 10
-	}
-	if neg {
-		buf = append([]byte{'-'}, buf...)
-	}
-	return string(buf)
+	_ = json.NewEncoder(w).Encode(response)
 }

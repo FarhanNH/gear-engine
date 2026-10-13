@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +58,27 @@ func okHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+}
+
+// testRateLimiter provides isolated state for middleware tests without Redis.
+type testRateLimiter struct {
+	mu       sync.Mutex
+	max      int
+	requests map[string]int
+}
+
+func newTestRateLimiter(max int) *testRateLimiter {
+	return &testRateLimiter{max: max, requests: make(map[string]int)}
+}
+
+func (rl *testRateLimiter) Allow(_ context.Context, ip string) (bool, int, error) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.requests[ip]++
+	if rl.requests[ip] > rl.max {
+		return false, 30, nil
+	}
+	return true, 0, nil
 }
 
 // ─── AuthMiddleware tests ─────────────────────────────────────────────────────
@@ -180,8 +202,7 @@ func TestAuthMiddleware_SkipLoginPath(t *testing.T) {
 // limit window are forwarded to the next handler.
 func TestRateLimitMiddleware_AllowsUnderLimit(t *testing.T) {
 	max := 3
-	window := 5 * time.Minute
-	mw := middleware.RateLimitMiddleware(max, window)(okHandler())
+	mw := middleware.RateLimitMiddleware(newTestRateLimiter(max))(okHandler())
 
 	for i := 0; i < max; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/v1/auth/login", nil)
@@ -198,8 +219,7 @@ func TestRateLimitMiddleware_AllowsUnderLimit(t *testing.T) {
 // within the window receives a 429 response with a Retry-After header.
 func TestRateLimitMiddleware_BlocksOverLimit(t *testing.T) {
 	max := 3
-	window := 5 * time.Minute
-	mw := middleware.RateLimitMiddleware(max, window)(okHandler())
+	mw := middleware.RateLimitMiddleware(newTestRateLimiter(max))(okHandler())
 
 	// Exhaust the limit.
 	for i := 0; i < max; i++ {
@@ -233,8 +253,7 @@ func TestRateLimitMiddleware_BlocksOverLimit(t *testing.T) {
 // other than /v1/auth/login are never rate-limited.
 func TestRateLimitMiddleware_SkipsNonLoginPath(t *testing.T) {
 	max := 1
-	window := time.Hour
-	mw := middleware.RateLimitMiddleware(max, window)(okHandler())
+	mw := middleware.RateLimitMiddleware(newTestRateLimiter(max))(okHandler())
 
 	// Send more requests than the limit allows — should all pass because
 	// the path is not /v1/auth/login.

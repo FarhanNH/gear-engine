@@ -18,6 +18,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/gear/engine/internal/config"
 	"github.com/gear/engine/internal/database"
@@ -29,8 +30,9 @@ import (
 
 // Server menyimpan semua dependensi runtime untuk gear-engine HTTP server.
 type Server struct {
-	cfg *config.Config
-	db  *sql.DB
+	cfg         *config.Config
+	db          *sql.DB
+	redisClient *redis.Client
 
 	masterKey []byte
 
@@ -82,13 +84,28 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("server: read master key: %w", err)
 	}
 
-	// 5. Inisialisasi services.
+	// 5. Connect to Redis and verify it is ready before serving traffic.
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
+	redisCtx, redisCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = redisClient.Ping(redisCtx).Err()
+	redisCancel()
+	if err != nil {
+		redisClient.Close()
+		db.Close()
+		return nil, fmt.Errorf("server: connect to Redis at %s: %w", cfg.RedisAddr, err)
+	}
+
+	// 6. Inisialisasi services.
 	secretSvc := service.NewSecretService(db, masterKey)
 	tokenSvc := service.NewTokenService(db)
 	policySvc := service.NewPolicyService(db)
 	auditSvc := service.NewAuditService(db)
 
-	// 6. Inisialisasi handlers.
+	// 7. Inisialisasi handlers.
 	authHandler := handler.NewAuthHandler(db, tokenSvc, cfg.SessionTTL)
 	secretHandler := handler.NewSecretHandler(secretSvc)
 	tokenHandler := handler.NewTokenHandler(tokenSvc)
@@ -98,6 +115,7 @@ func New(cfg *config.Config) (*Server, error) {
 	s := &Server{
 		cfg:           cfg,
 		db:            db,
+		redisClient:   redisClient,
 		masterKey:     masterKey,
 		secretSvc:     secretSvc,
 		tokenSvc:      tokenSvc,
@@ -110,7 +128,7 @@ func New(cfg *config.Config) (*Server, error) {
 		auditHandler:  auditHandler,
 	}
 
-	// 7. Bangun chi router.
+	// 8. Bangun chi router.
 	s.router = s.buildRouter()
 
 	return s, nil
@@ -172,7 +190,11 @@ func (s *Server) buildRouter() chi.Router {
 		r.Route("/auth", func(r chi.Router) {
 			// Rate limit: hanya POST /v1/auth/login
 			r.With(
-				middleware.RateLimitMiddleware(s.cfg.RateLimitMax, s.cfg.RateLimitWindow),
+				middleware.RateLimitMiddleware(middleware.NewRedisRateLimiter(
+					s.redisClient,
+					s.cfg.RateLimitMax,
+					s.cfg.RateLimitWindow,
+				)),
 			).Post("/login", s.authHandler.Login)
 
 			// Logout butuh autentikasi
@@ -356,6 +378,15 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 //
 // Validates: Requirements 9.1, 9.2, 9.3
 func (s *Server) Run() error {
+	defer func() {
+		if err := s.redisClient.Close(); err != nil {
+			log.Printf("WARN: Redis close error: %v", err)
+		}
+		if err := database.Close(s.db); err != nil {
+			log.Printf("WARN: database close error: %v", err)
+		}
+	}()
+
 	// 1. Jalankan HTTP redirect server di goroutine terpisah.
 	httpSrv := &http.Server{
 		Addr:    s.cfg.HTTPAddr,
@@ -416,11 +447,6 @@ func (s *Server) Run() error {
 	defer shutdownCancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("WARN: HTTP redirect server forced shutdown: %v", err)
-	}
-
-	// Tutup database connection.
-	if err := database.Close(s.db); err != nil {
-		log.Printf("WARN: database close error: %v", err)
 	}
 
 	log.Printf("INFO: server shutdown complete")

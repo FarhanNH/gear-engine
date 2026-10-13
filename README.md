@@ -16,6 +16,7 @@ Gear adalah tool manajemen secret sederhana yang terinspirasi dari HashiCorp Vau
 
 - Go 1.22+
 - Sertifikat & private key TLS (untuk menjalankan server)
+- Redis 6+ (penyimpanan bersama untuk rate limiter)
 - **uv** (Python package manager) — untuk graphify
 
 ## Graphify — Knowledge Graph
@@ -90,7 +91,15 @@ Konfigurasi dibaca dari environment variables:
 | `GEAR_CORS_ORIGIN` | *(kosong)* | Daftar origin CORS (comma-separated) |
 | `GEAR_RATE_LIMIT_MAX` | `10` | Maks percobaan login per window per IP |
 | `GEAR_RATE_LIMIT_WINDOW` | `5m` | Durasi sliding window rate limit |
+| `GEAR_REDIS_ADDR` | `localhost:6379` | Alamat Redis untuk counter rate limit |
+| `GEAR_REDIS_PASSWORD` | *(kosong)* | Password Redis jika autentikasi diaktifkan |
+| `GEAR_REDIS_DB` | `0` | Nomor database Redis untuk rate limiter |
 | `GEAR_SESSION_TTL` | `12h` | TTL default session token admin |
+
+Redis harus dapat diakses oleh setiap replica `gear-engine`. Counter rate limit
+login disimpan sebagai sliding window bersama di Redis; jika Redis tidak dapat
+dihubungi, proses gagal saat startup dan endpoint login mengembalikan `503` jika
+koneksi terputus setelah startup.
 
 ## API
 
