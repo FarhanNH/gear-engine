@@ -1,0 +1,7 @@
+{
+  "task_id": "task-gear-fix-deploy-2025-06-13",
+  "task_description": "Fix two bugs: (1) admin session token gets 403 on /v1/list/ and secret endpoints due to policyMiddleware calling Evaluate() unconditionally; (2) gear-ui-vue has no logout button. Then deploy and verify both fixes on aerentix-vps.",
+  "status": "completed",
+  "feature_order": ["FEAT-001", "FEAT-002"],
+  "blocked_reason": null
+}
