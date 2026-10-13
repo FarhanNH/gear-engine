@@ -179,6 +179,11 @@ func (s *Server) buildRouter() chi.Router {
 			r.With(
 				middleware.AuthMiddleware(s.tokenSvc),
 			).Post("/logout", s.authHandler.Logout)
+
+			// Change password butuh autentikasi
+			r.With(
+				middleware.AuthMiddleware(s.tokenSvc),
+			).Post("/change-password", s.authHandler.ChangePassword)
 		})
 
 		// ── /v1/secret/* ────────────────────────────────────────────────────────

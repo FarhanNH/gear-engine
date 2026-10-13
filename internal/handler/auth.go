@@ -100,6 +100,72 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// changePasswordRequest adalah body request untuk POST /v1/auth/change-password.
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// ChangePassword menangani POST /v1/auth/change-password.
+// Memverifikasi password saat ini lalu menggantinya dengan password baru.
+//
+// Single-admin system: query `SELECT id, password_hash FROM admins LIMIT 1`
+// karena sesi tidak menyimpan identitas admin (hanya token.ID dan token.Name).
+func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	// 1. Pastikan request sudah terautentikasi.
+	if middleware.TokenIDFromContext(r.Context()) == nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// 2. Decode request body.
+	var req changePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.CurrentPassword == "" || req.NewPassword == "" {
+		writeError(w, http.StatusBadRequest, "current_password and new_password are required")
+		return
+	}
+
+	// 3. Ambil id dan password_hash admin saat ini (single-admin system).
+	var adminID int64
+	var passwordHash string
+	err := h.db.QueryRowContext(r.Context(),
+		`SELECT id, password_hash FROM admins LIMIT 1`,
+	).Scan(&adminID, &passwordHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	// 4. Verifikasi password saat ini.
+	if err := h.bcrypt(passwordHash, req.CurrentPassword); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+
+	// 5. Hash password baru.
+	newHash, err := crypto.HashPassword(req.NewPassword)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	// 6. Update password hash di DB.
+	if _, err := h.db.ExecContext(r.Context(),
+		`UPDATE admins SET password_hash = ? WHERE id = ?`,
+		newHash, adminID,
+	); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
+
+	// 7. Return 204 No Content.
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // Logout menangani POST /v1/auth/logout.
 // Me-revoke session token yang aktif dari context.
 //

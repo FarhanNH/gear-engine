@@ -3,13 +3,18 @@ package handler_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	_ "modernc.org/sqlite"
+
+	"github.com/gear/engine/internal/crypto"
 	"github.com/gear/engine/internal/handler"
+	"github.com/gear/engine/internal/middleware"
 	"github.com/gear/engine/internal/model"
 	"github.com/gear/engine/internal/service"
 )
@@ -431,5 +436,147 @@ func TestAuditHandler_GetAuditLog_InvalidSince(t *testing.T) {
 	decodeJSON(t, rr.Body, &resp)
 	if _, ok := resp["error"]; !ok {
 		t.Error("expected JSON error field")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ChangePassword tests
+// ---------------------------------------------------------------------------
+
+// setupAdminsDB membuat in-memory SQLite DB dengan tabel admins yang sudah di-seed.
+// Password admin adalah "correct-password".
+func setupAdminsDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open in-memory db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	_, err = db.Exec(`CREATE TABLE admins (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		username      TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		created_at    INTEGER NOT NULL
+	)`)
+	if err != nil {
+		t.Fatalf("create admins table: %v", err)
+	}
+
+	hash, err := crypto.HashPassword("correct-password")
+	if err != nil {
+		t.Fatalf("hash seed password: %v", err)
+	}
+	_, err = db.Exec(
+		`INSERT INTO admins (username, password_hash, created_at) VALUES (?, ?, ?)`,
+		"admin", hash, time.Now().Unix(),
+	)
+	if err != nil {
+		t.Fatalf("seed admin row: %v", err)
+	}
+
+	return db
+}
+
+// withTokenCtx returns a copy of req with a token ID injected into context.
+func withTokenCtx(req *http.Request, id int64) *http.Request {
+	return req.WithContext(middleware.WithTokenID(req.Context(), id))
+}
+
+// TestChangePassword_MissingAuth — no token in context → 401
+func TestChangePassword_MissingAuth(t *testing.T) {
+	db := setupAdminsDB(t)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+
+	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
+		"current_password": "correct-password",
+		"new_password":     "new-password-123",
+	})
+	rr := httptest.NewRecorder()
+	h.ChangePassword(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+// TestChangePassword_EmptyCurrentPassword — empty current_password → 400
+func TestChangePassword_EmptyCurrentPassword(t *testing.T) {
+	db := setupAdminsDB(t)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+
+	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
+		"current_password": "",
+		"new_password":     "new-password-123",
+	})
+	req = withTokenCtx(req, 1)
+	rr := httptest.NewRecorder()
+	h.ChangePassword(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+// TestChangePassword_EmptyNewPassword — empty new_password → 400
+func TestChangePassword_EmptyNewPassword(t *testing.T) {
+	db := setupAdminsDB(t)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+
+	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
+		"current_password": "correct-password",
+		"new_password":     "",
+	})
+	req = withTokenCtx(req, 1)
+	rr := httptest.NewRecorder()
+	h.ChangePassword(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+// TestChangePassword_WrongCurrentPassword — wrong current_password → 401
+func TestChangePassword_WrongCurrentPassword(t *testing.T) {
+	db := setupAdminsDB(t)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+
+	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
+		"current_password": "wrong-password",
+		"new_password":     "new-password-123",
+	})
+	req = withTokenCtx(req, 1)
+	rr := httptest.NewRecorder()
+	h.ChangePassword(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", rr.Code)
+	}
+}
+
+// TestChangePassword_Success — valid request → 204 + DB hash updated
+func TestChangePassword_Success(t *testing.T) {
+	db := setupAdminsDB(t)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+
+	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
+		"current_password": "correct-password",
+		"new_password":     "new-password-123",
+	})
+	req = withTokenCtx(req, 1)
+	rr := httptest.NewRecorder()
+	h.ChangePassword(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", rr.Code)
+	}
+
+	// Pastikan hash di DB sudah berubah dan cocok dengan password baru.
+	var newHash string
+	if err := db.QueryRow(`SELECT password_hash FROM admins LIMIT 1`).Scan(&newHash); err != nil {
+		t.Fatalf("scan updated hash: %v", err)
+	}
+	if err := crypto.VerifyPassword(newHash, "new-password-123"); err != nil {
+		t.Errorf("new hash should verify against 'new-password-123': %v", err)
 	}
 }
