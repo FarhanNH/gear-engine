@@ -1,0 +1,31 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Add Change Password page to gear-ui-vue (Vue 3, lives ONLY on VPS at 103.118.175.235:/root/projects/gear-ui-vue — not in local workspace). All file reads and writes must go through server-manager::exec with server_name 'aerentix-vps'. Depends on FEAT-001 being merged/deployed first so the backend endpoint exists.",
+  "status": "completed",
+  "steps": [
+    "Read context.json and this file FIRST. The frontend source is NOT in the local workspace — all reads and writes happen via server-manager::exec tool with server_name 'aerentix-vps'.",
+    "Read existing files for context: (a) cat /root/projects/gear-ui-vue/src/views/Login.vue — style reference; (b) cat /root/projects/gear-ui-vue/src/api/client.ts — understand apiFetch signature; (c) cat /root/projects/gear-ui-vue/src/router/index.ts — route registration pattern; (d) cat /root/projects/gear-ui-vue/src/App.vue — navbar location; (e) cat /root/projects/gear-ui-vue/src/store/auth.ts — auth store shape.",
+    "Create /root/projects/gear-ui-vue/src/views/ChangePassword.vue. The component must: (a) have a form with three <input type='password'> fields: currentPassword, newPassword, confirmPassword; (b) client-side validation: if newPassword !== confirmPassword show inline error, do NOT submit; (c) on submit call apiFetch('POST', '/v1/auth/change-password', { current_password: currentPassword, new_password: newPassword }); (d) on 204 success show a success banner ('Password changed successfully'); (e) on error show error message; (f) style using the same CSS classes and color tokens as Login.vue (.btn, .btn--primary, #4f46e5). Write the file via server-manager::exec using a heredoc: `cat << 'VEOF' > /root/projects/gear-ui-vue/src/views/ChangePassword.vue ... VEOF`.",
+    "Update /root/projects/gear-ui-vue/src/router/index.ts: add a route { path: '/change-password', name: 'change-password', component: () => import('../views/ChangePassword.vue'), meta: { requiresAuth: true } }. Follow the existing pattern for other authenticated routes. Write the updated file back via server-manager::exec.",
+    "Update /root/projects/gear-ui-vue/src/App.vue: add a 'Change Password' router-link or button in the navbar alongside the Logout button. Inspect the current App.vue content first; if there is a nav bar component, add the link there. Style consistently with the Logout button (same .btn class). Write the updated file back via server-manager::exec.",
+    "Deploy on VPS: cd /root/projects && docker compose build --no-cache gear-ui && docker compose up -d gear-ui. Wait for container to come up.",
+    "Verify: docker ps shows gear-ui Up. Open http://103.118.175.235:30003 in browser (or curl), login, confirm 'Change Password' link is visible in navbar."
+  ],
+  "acceptance_criteria": [
+    "docker ps on VPS shows gear-ui container Up after deploy",
+    "Navigating to http://103.118.175.235:30003/change-password shows the Change Password form",
+    "Navbar shows a 'Change Password' link/button beside Logout when logged in",
+    "Submitting the form with mismatched new/confirm passwords shows client-side error without API call",
+    "Submitting with correct current password and matching new passwords calls POST /v1/auth/change-password and shows success banner",
+    "Submitting with wrong current password shows error message from the API"
+  ],
+  "verification": [
+    "On VPS: docker ps | grep gear-ui — shows Up",
+    "On VPS: docker logs gear-ui 2>&1 | tail -5 — no errors",
+    "Browser: http://103.118.175.235:30003 → login → navbar shows Change Password link",
+    "Browser: http://103.118.175.235:30003/change-password — form renders with 3 password fields"
+  ],
+  "blocked_reason": null,
+  "findings": "apiFetch signature: apiFetch(path: string, options: RequestInit = {}): Promise<Response> — single path string + standard RequestInit, no separate method arg. Called as apiFetch('/v1/auth/change-password', { method: 'POST', body: JSON.stringify({...}) }). 204 status indicates success (no body). Deploy: gear-engine uses 'build: ./gear-engine' so required git pull on VPS then docker compose build --no-cache; gear-ui same pattern. Both containers came up clean after rebuild."
+}
