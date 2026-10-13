@@ -1,0 +1,43 @@
+# Build output
+bin/
+dist/
+
+# Go binary artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Module download cache
+vendor/
+
+# Environment files (never commit secrets)
+.env
+.env.local
+.env.*.local
+*.env
+master.key
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Graphify knowledge graph output
+graphify-out/
+
+# Kiro agent task artifacts
+.agents/
