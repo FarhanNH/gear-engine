@@ -1,0 +1,17 @@
+.git
+.github
+*.md
+bin/
+tmp/
+.env
+*.env
+.env.*
+.agents
+.codex
+.kiro
+graphify-out
+deploy
+*.db
+*.db-*
+*.key
+*.pem

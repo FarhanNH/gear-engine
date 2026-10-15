@@ -190,6 +190,24 @@ Konvensi test:
 - `*_pbt_test.go` — property-based test (gopter)
 - `*_integration_test.go` — integration test
 
+## CI/CD
+
+Workflow `.github/workflows/deploy.yml` menjalankan pemeriksaan pada push/PR ke
+`master`. Push tag `vMAJOR.MINOR.PATCH` yang commit-nya sudah berada di `master`
+akan membangun image `ghcr.io/farhannh/gear-engine:<tag>` lalu memanggil
+`/opt/apps/gear/deploy.sh gear-engine <tag>` di VPS.
+
+Paket bersama di [`deploy/`](deploy/) berisi Compose, script deployment,
+contoh environment, dan test script. Paket tersebut harus dipasang pada VPS
+sebelum rilis; workflow tidak menyalinnya otomatis. Secrets yang diperlukan:
+`VPS_HOST`, `VPS_PORT`, `VPS_USER`, `VPS_SSH_KEY`, dan `VPS_FINGERPRINT`.
+User VPS juga harus dapat menarik image GHCR private.
+
+Script mempertahankan tag UI, data engine, dan Redis existing; kegagalan
+startup/smoke check memicu percobaan rollback image. Buat backup database dan
+master key sebelum rilis yang mengubah data; rollback image tidak membatalkan
+migrasi database.
+
 ## Status
 
 Fase 1 (MVP): TLS wajib, autentikasi token, CRUD secret via REST API. Kolom `version` pada tabel secret sudah disiapkan untuk versioning di masa depan.

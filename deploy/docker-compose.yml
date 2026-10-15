@@ -1,0 +1,56 @@
+# Reuses the running production project and network. Redis remains managed separately.
+name: projects
+
+services:
+  gear-engine:
+    image: ghcr.io/farhannh/gear-engine:${ENGINE_TAG:?Set ENGINE_TAG in .env}
+    container_name: gear-engine
+    command: ["serve"]
+    restart: unless-stopped
+    env_file: engine.env
+    volumes:
+      - type: bind
+        source: /root/projects/gear-data
+        target: /app/data
+        bind:
+          create_host_path: false
+    # Preserve existing public endpoints during the CI/CD transition.
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    healthcheck:
+      # BusyBox wget also exists in the pre-CI/CD image used for bootstrap rollback.
+      test: ["CMD-SHELL", "wget -T 5 -S -O /dev/null --no-check-certificate https://127.0.0.1:8443/v1/token 2>&1 | grep -q 'HTTP/1.1 401'"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gear-ui:
+    image: ghcr.io/farhannh/gear-ui-vue:${UI_TAG:?Set UI_TAG in .env}
+    container_name: gear-ui
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+      - "30003:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default:
+    external: true
+    name: projects_default
