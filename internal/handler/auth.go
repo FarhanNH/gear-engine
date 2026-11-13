@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"time"
 
@@ -17,23 +18,26 @@ type AuthHandler struct {
 	db         *sql.DB
 	tokenSvc   service.TokenService
 	sessionTTL time.Duration
+	turnstile  TurnstileVerifier
 	bcrypt     func(hash, password string) error
 }
 
 // NewAuthHandler membuat instance baru AuthHandler.
-func NewAuthHandler(db *sql.DB, tokenSvc service.TokenService, sessionTTL time.Duration) *AuthHandler {
+func NewAuthHandler(db *sql.DB, tokenSvc service.TokenService, sessionTTL time.Duration, turnstile TurnstileVerifier) *AuthHandler {
 	return &AuthHandler{
 		db:         db,
 		tokenSvc:   tokenSvc,
 		sessionTTL: sessionTTL,
+		turnstile:  turnstile,
 		bcrypt:     crypto.VerifyPassword,
 	}
 }
 
 // loginRequest adalah body request untuk POST /v1/auth/login.
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	TurnstileToken string `json:"turnstile_token"`
 }
 
 // loginResponse adalah body response sukses dari POST /v1/auth/login.
@@ -59,6 +63,19 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+
+	// 2. Verifikasi Turnstile sebelum cek password (fail-closed).
+	if h.turnstile != nil {
+		remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			remoteIP = r.RemoteAddr
+		}
+		ok, err := h.turnstile.Verify(r.Context(), req.TurnstileToken, remoteIP)
+		if err != nil || !ok {
+			writeAuthError(w)
+			return
+		}
 	}
 
 	// 2. Query password hash dari DB berdasarkan username.

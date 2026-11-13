@@ -29,8 +29,11 @@ if [[ "$*" == *' pull '* && ${FAIL_PULL:-0} == 1 ]]; then exit 1; fi
 if [[ "$*" == *' up '* && ${ENGINE_TAG:-${UI_TAG:-}} == v9.9.9 ]]; then exit 1; fi
 ''')
         (mock / "curl").write_text('''#!/usr/bin/env bash
-if [[ "$*" == *'/v1/token' ]]; then printf 401; else printf 200; fi
+echo "curl $*" >> "$LOG"
+if [[ ${FAIL_VERIFY:-0} == 1 ]]; then printf 503; exit 0; fi
+if [[ "$*" == *'https://127.0.0.1:8443/v1/token'* ]]; then printf 401; else printf 000; fi
 ''')
+        (mock / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n")
         for file in mock.iterdir():
             file.chmod(0o755)
 
@@ -46,8 +49,8 @@ if [[ "$*" == *'/v1/token' ]]; then printf 401; else printf 200; fi
         calls = (self.root / "calls").read_text()
         self.assertIn("pull gear-engine", calls)
         self.assertIn("--wait-timeout 120 gear-engine", calls)
-        self.assertIn("exec gear-ui nginx -s reload", calls)
-        self.assertNotIn("--wait-timeout 120 gear-ui", calls)
+        self.assertIn("curl -skS --max-time 5 -o /dev/null -w %{http_code} https://127.0.0.1:8443/v1/token", calls)
+        self.assertNotIn("gear-ui", calls.replace("--wait-timeout 120 gear-engine", ""))
 
     def test_ui_success_preserves_engine(self):
         result = self.run_deploy("gear-ui")
@@ -72,13 +75,13 @@ if [[ "$*" == *'/v1/token' ]]; then printf 401; else printf 200; fi
         self.assertNotIn(" up ", (self.root / "calls").read_text())
 
     def test_smoke_failure_triggers_rollback(self):
-        self.env["FAIL_VERIFY_ONCE"] = "1"
+        self.env["FAIL_VERIFY"] = "1"
         result = self.run_deploy()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.root / ".env").read_text(), self.original)
         calls = (self.root / "calls").read_text()
         self.assertIn("baseline|baseline|compose --project-name projects --env-file .env -f docker-compose.yml up", calls)
-        self.assertIn("exec gear-ui nginx -s reload", calls)
+        self.assertIn("curl -skS --max-time 5 -o /dev/null -w %{http_code} https://127.0.0.1:8443/v1/token", calls)
 
     def test_two_repositories_preserve_both_tag_updates(self):
         command = ["bash", str(self.root / "deploy.sh")]

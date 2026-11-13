@@ -62,6 +62,21 @@ type Config struct {
 	// SessionTTL is the default TTL for admin session tokens.
 	// Env: GEAR_SESSION_TTL, default: 12h
 	SessionTTL time.Duration
+
+	// TurnstileEnabled enables Cloudflare Turnstile verification on login.
+	// Env: GEAR_TURNSTILE_ENABLED, default: true
+	TurnstileEnabled bool
+
+	// TurnstileSecretFile is the path to the file containing the Turnstile secret key.
+	// Env: GEAR_TURNSTILE_SECRET_FILE
+	TurnstileSecretFile string
+
+	// TurnstileSecret is loaded from TurnstileSecretFile when TurnstileEnabled is true.
+	TurnstileSecret string
+
+	// TurnstileTimeout is the HTTP timeout for Cloudflare siteverify requests.
+	// Env: GEAR_TURNSTILE_TIMEOUT, default: 5s
+	TurnstileTimeout time.Duration
 }
 
 // Load reads configuration from environment variables and applies defaults.
@@ -135,6 +150,43 @@ func Load() (*Config, error) {
 		cfg.SessionTTL = d
 	} else {
 		cfg.SessionTTL = 12 * time.Hour
+	}
+
+	// GEAR_TURNSTILE_ENABLED — optional bool, default true
+	cfg.TurnstileEnabled = true
+	if raw := getEnv("GEAR_TURNSTILE_ENABLED", ""); raw != "" {
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, errors.New("invalid GEAR_TURNSTILE_ENABLED: must be a boolean")
+		}
+		cfg.TurnstileEnabled = v
+	}
+
+	// GEAR_TURNSTILE_TIMEOUT — optional duration, default 5s
+	if raw := getEnv("GEAR_TURNSTILE_TIMEOUT", ""); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, errors.New("invalid GEAR_TURNSTILE_TIMEOUT: must be a positive duration (e.g. 5s)")
+		}
+		cfg.TurnstileTimeout = d
+	} else {
+		cfg.TurnstileTimeout = 5 * time.Second
+	}
+
+	cfg.TurnstileSecretFile = getEnv("GEAR_TURNSTILE_SECRET_FILE", "")
+	if cfg.TurnstileEnabled {
+		if cfg.TurnstileSecretFile == "" {
+			return nil, errors.New("GEAR_TURNSTILE_SECRET_FILE is required when GEAR_TURNSTILE_ENABLED is true")
+		}
+		data, err := os.ReadFile(cfg.TurnstileSecretFile)
+		if err != nil {
+			return nil, errors.New("failed to read GEAR_TURNSTILE_SECRET_FILE")
+		}
+		secret := strings.TrimSpace(string(data))
+		if secret == "" {
+			return nil, errors.New("GEAR_TURNSTILE_SECRET_FILE is empty")
+		}
+		cfg.TurnstileSecret = secret
 	}
 
 	// Validation: TLS cert and key are required.

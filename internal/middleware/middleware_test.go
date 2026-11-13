@@ -289,7 +289,7 @@ func TestCORSMiddleware_AllowedOrigin(t *testing.T) {
 	headers := map[string]string{
 		"Access-Control-Allow-Origin":  "https://app.example.com",
 		"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-		"Access-Control-Allow-Headers": "Authorization, Content-Type",
+		"Access-Control-Allow-Headers": "Authorization, Content-Type, X-Gear-Client",
 	}
 	for k, want := range headers {
 		if got := rr.Header().Get(k); got != want {
@@ -339,6 +339,9 @@ func TestCORSMiddleware_PreflightOptions(t *testing.T) {
 	}
 	if handlerCalled {
 		t.Error("downstream handler must NOT be called for OPTIONS preflight")
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type, X-Gear-Client" {
+		t.Errorf("expected Access-Control-Allow-Headers to include X-Gear-Client, got %q", got)
 	}
 }
 

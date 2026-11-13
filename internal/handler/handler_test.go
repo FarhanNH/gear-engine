@@ -486,7 +486,7 @@ func withTokenCtx(req *http.Request, id int64) *http.Request {
 // TestChangePassword_MissingAuth — no token in context → 401
 func TestChangePassword_MissingAuth(t *testing.T) {
 	db := setupAdminsDB(t)
-	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour, nil)
 
 	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
 		"current_password": "correct-password",
@@ -503,7 +503,7 @@ func TestChangePassword_MissingAuth(t *testing.T) {
 // TestChangePassword_EmptyCurrentPassword — empty current_password → 400
 func TestChangePassword_EmptyCurrentPassword(t *testing.T) {
 	db := setupAdminsDB(t)
-	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour, nil)
 
 	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
 		"current_password": "",
@@ -521,7 +521,7 @@ func TestChangePassword_EmptyCurrentPassword(t *testing.T) {
 // TestChangePassword_EmptyNewPassword — empty new_password → 400
 func TestChangePassword_EmptyNewPassword(t *testing.T) {
 	db := setupAdminsDB(t)
-	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour, nil)
 
 	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
 		"current_password": "correct-password",
@@ -539,7 +539,7 @@ func TestChangePassword_EmptyNewPassword(t *testing.T) {
 // TestChangePassword_WrongCurrentPassword — wrong current_password → 401
 func TestChangePassword_WrongCurrentPassword(t *testing.T) {
 	db := setupAdminsDB(t)
-	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour, nil)
 
 	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
 		"current_password": "wrong-password",
@@ -557,7 +557,7 @@ func TestChangePassword_WrongCurrentPassword(t *testing.T) {
 // TestChangePassword_Success — valid request → 204 + DB hash updated
 func TestChangePassword_Success(t *testing.T) {
 	db := setupAdminsDB(t)
-	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour)
+	h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour, nil)
 
 	req := newSecretRequest(http.MethodPost, "/v1/auth/change-password", map[string]string{
 		"current_password": "correct-password",

@@ -106,7 +106,11 @@ func New(cfg *config.Config) (*Server, error) {
 	auditSvc := service.NewAuditService(db)
 
 	// 7. Inisialisasi handlers.
-	authHandler := handler.NewAuthHandler(db, tokenSvc, cfg.SessionTTL)
+	var turnstile handler.TurnstileVerifier
+	if cfg.TurnstileEnabled {
+		turnstile = handler.NewTurnstileVerifier(cfg.TurnstileSecret, cfg.TurnstileTimeout)
+	}
+	authHandler := handler.NewAuthHandler(db, tokenSvc, cfg.SessionTTL, turnstile)
 	secretHandler := handler.NewSecretHandler(secretSvc)
 	tokenHandler := handler.NewTokenHandler(tokenSvc)
 	policyHandler := handler.NewPolicyHandler(policySvc)

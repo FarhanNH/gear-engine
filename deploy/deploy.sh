@@ -31,19 +31,15 @@ candidate() {
   env "$tag_key=$version" docker compose --project-name projects --env-file .env -f docker-compose.yml "$@"
 }
 verify() {
-  # Nginx resolves upstream container names on startup/reload.
-  docker exec gear-ui nginx -t || return 1
-  docker exec gear-ui nginx -s reload || return 1
-  local ui_status api_status
+  local api_status
   for ((attempt = 0; attempt < 20; attempt++)); do
-    ui_status=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/ || true)
-    api_status=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/v1/token || true)
-    if [[ $ui_status == 200 && $api_status == 401 ]]; then
+    api_status=$(curl -skS --max-time 5 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/v1/token || true)
+    if [[ $api_status == 401 ]]; then
       return 0
     fi
     sleep 2
   done
-  echo "Smoke check failed: UI=$ui_status API=$api_status (expected 200/401)" >&2
+  echo "Smoke check failed: API=$api_status (expected 401)" >&2
   return 1
 }
 
