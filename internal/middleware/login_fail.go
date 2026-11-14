@@ -42,17 +42,21 @@ redis.call('PEXPIRE', KEYS[1], math.ceil(window/1000))
 return 0
 `)
 
-func (l *RedisLoginFailures) Reserve(ctx context.Context, username string) (int, error) {
+func (l *RedisLoginFailures) Reserve(ctx context.Context, username string) (string, int, error) {
 	var member [16]byte
 	if _, err := rand.Read(member[:]); err != nil {
-		return 0, fmt.Errorf("generate login failure member: %w", err)
+		return "", 0, fmt.Errorf("generate login failure member: %w", err)
 	}
-	n, err := loginFailureReserve.Run(ctx, l.client, []string{loginFailureKey(username)}, l.max, l.window.Microseconds(), hex.EncodeToString(member[:])).Int64()
+	id := hex.EncodeToString(member[:])
+	n, err := loginFailureReserve.Run(ctx, l.client, []string{loginFailureKey(username)}, l.max, l.window.Microseconds(), id).Int64()
 	if err != nil {
-		return 0, fmt.Errorf("reserve login failure: %w", err)
+		return "", 0, fmt.Errorf("reserve login failure: %w", err)
 	}
-	return int(n), nil
+	if n > 0 {
+		return "", int(n), nil
+	}
+	return id, 0, nil
 }
-func (l *RedisLoginFailures) Reset(ctx context.Context, username string) error {
-	return l.client.Del(ctx, loginFailureKey(username)).Err()
+func (l *RedisLoginFailures) Release(ctx context.Context, username, member string) error {
+	return l.client.ZRem(ctx, loginFailureKey(username), member).Err()
 }

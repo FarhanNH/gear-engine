@@ -30,8 +30,8 @@ type AuthHandler struct {
 }
 
 type LoginFailureLimiter interface {
-	Reserve(context.Context, string) (int, error)
-	Reset(context.Context, string) error
+	Reserve(context.Context, string) (string, int, error)
+	Release(context.Context, string, string) error
 }
 
 func (h *AuthHandler) SetLoginFailureLimiter(l LoginFailureLimiter) { h.loginFailures = l }
@@ -79,9 +79,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var member string
 	if h.loginFailures != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		retry, err := h.loginFailures.Reserve(ctx, req.Username)
+		var retry int
+		var err error
+		member, retry, err = h.loginFailures.Reserve(ctx, req.Username)
 		cancel()
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
@@ -141,12 +144,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	if h.loginFailures != nil {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
-		err := h.loginFailures.Reset(ctx, req.Username)
+		err := h.loginFailures.Release(ctx, req.Username, member)
 		cancel()
 		if err != nil {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
 			if err := h.tokenSvc.Revoke(ctx, tokenID); err != nil {
-				log.Printf("ERROR: failed to revoke undisclosed session token id=%d after limiter reset failure", tokenID)
+				log.Printf("ERROR: failed to revoke undisclosed session token id=%d after limiter release failure", tokenID)
 			}
 			cancel()
 			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")

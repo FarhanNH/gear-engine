@@ -32,8 +32,8 @@ func (f *fakeRedis) EvalSha(ctx context.Context, sha string, keys []string, args
 	c.SetErr(f.err)
 	return c
 }
-func (f *fakeRedis) Del(ctx context.Context, keys ...string) *redis.IntCmd {
-	f.keys = keys
+func (f *fakeRedis) ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd {
+	f.keys, f.args = []string{key}, members
 	c := redis.NewIntCmd(ctx)
 	c.SetErr(f.err)
 	return c
@@ -42,18 +42,26 @@ func TestRedisLoginFailuresPassesHashedKeyAndPropagatesErrors(t *testing.T) {
 	f := &fakeRedis{value: 42}
 	l := NewRedisLoginFailures(f, 5, 15*time.Minute)
 	ctx := context.Background()
-	retry, err := l.Reserve(ctx, " Admin ")
+	member, retry, err := l.Reserve(ctx, " Admin ")
 	if err != nil || retry != 42 || len(f.keys) != 1 || f.keys[0] != loginFailureKey("admin") || len(f.args) != 3 || f.args[0] != 5 || f.args[1] != (15*time.Minute).Microseconds() {
 		t.Fatalf("reserve: %d %v keys=%v args=%v", retry, err, f.keys, f.args)
 	}
-	if err := l.Reset(ctx, " Admin "); err != nil || f.keys[0] != loginFailureKey("admin") {
-		t.Fatalf("reset: %v", err)
+	if member != "" {
+		t.Fatalf("blocked reservation has member %q", member)
+	}
+	f.value = 0
+	member, retry, err = l.Reserve(ctx, " Admin ")
+	if err != nil || retry != 0 || member == "" || member != f.args[2] {
+		t.Fatalf("member=%q retry=%d err=%v", member, retry, err)
+	}
+	if err := l.Release(ctx, " Admin ", member); err != nil || f.keys[0] != loginFailureKey("admin") || len(f.args) != 1 || f.args[0] != member {
+		t.Fatalf("release: %v", err)
 	}
 	f.err = errors.New("unavailable")
-	if _, err := l.Reserve(ctx, "admin"); err == nil {
+	if _, _, err := l.Reserve(ctx, "admin"); err == nil {
 		t.Fatal("reserve ignored error")
 	}
-	if err := l.Reset(ctx, "admin"); err == nil {
-		t.Fatal("reset ignored error")
+	if err := l.Release(ctx, "admin", member); err == nil {
+		t.Fatal("release ignored error")
 	}
 }

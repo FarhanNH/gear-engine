@@ -31,8 +31,8 @@ func (r *prefixedTestRedis) EvalSha(ctx context.Context, sha string, keys []stri
 func (r *prefixedTestRedis) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
 	return r.UniversalClient.Eval(ctx, script, r.keys(keys), args...)
 }
-func (r *prefixedTestRedis) Del(ctx context.Context, keys ...string) *redis.IntCmd {
-	return r.UniversalClient.Del(ctx, r.keys(keys)...)
+func (r *prefixedTestRedis) ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd {
+	return r.UniversalClient.ZRem(ctx, r.prefix+key, members...)
 }
 
 func testRedisLimiter(t *testing.T, window time.Duration) (*RedisLoginFailures, *redis.Client, string) {
@@ -74,7 +74,7 @@ func TestParallelLoginReservations(t *testing.T) {
 		go func() {
 			defer done.Done()
 			<-start
-			retry, err := l.Reserve(context.Background(), "alice")
+			_, retry, err := l.Reserve(context.Background(), "alice")
 			results <- result{retry, err}
 		}()
 	}
@@ -101,33 +101,87 @@ func TestRedisLoginFailuresIntegration(t *testing.T) {
 	l, client, prefix := testRedisLimiter(t, 300*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	reserve := func(user string, blocked bool) {
+	reserve := func(user string, blocked bool) string {
 		t.Helper()
-		retry, err := l.Reserve(ctx, user)
+		member, retry, err := l.Reserve(ctx, user)
 		if err != nil || (retry > 0) != blocked {
 			t.Fatalf("reserve %s: retry=%d err=%v blocked=%v", user, retry, err, blocked)
 		}
+		return member
 	}
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 4; i++ {
 		reserve("alice", false)
 	}
+	success := reserve("alice", false)
 	reserve("alice", true)
 	for i := 0; i < 5; i++ {
 		reserve("bob", false)
 	}
-	if err := l.Reset(ctx, "alice"); err != nil {
+	if err := l.Release(ctx, "alice", success); err != nil {
 		t.Fatal(err)
 	}
 	reserve("bob", true)
-	if n, err := client.Exists(ctx, prefix+loginFailureKey("alice")).Result(); err != nil || n != 0 {
-		t.Fatalf("reset key exists=%d err=%v", n, err)
+	if n, err := client.ZCard(ctx, prefix+loginFailureKey("alice")).Result(); err != nil || n != 4 {
+		t.Fatalf("remaining=%d err=%v", n, err)
 	}
-	for i := 0; i < 5; i++ {
-		reserve("alice", false)
-	}
+	reserve("alice", false)
 	reserve("alice", true)
 	time.Sleep(400 * time.Millisecond)
 	reserve("alice", false)
+}
+
+func TestSuccessfulLoginPreservesOtherReservations(t *testing.T) {
+	l, client, prefix := testRedisLimiter(t, 15*time.Minute)
+	ctx := context.Background()
+	a, retry, err := l.Reserve(ctx, "alice")
+	if err != nil || retry != 0 || a == "" {
+		t.Fatalf("reserve A: member=%q retry=%d err=%v", a, retry, err)
+	}
+	type reservation struct {
+		member string
+		retry  int
+		err    error
+	}
+	ready := make(chan reservation, 4)
+	finish := make(chan struct{})
+	defer close(finish)
+	for i := 0; i < 4; i++ {
+		go func() {
+			member, retry, err := l.Reserve(ctx, "alice")
+			ready <- reservation{member, retry, err}
+			<-finish
+		}()
+	}
+	others := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		r := <-ready
+		if r.err != nil || r.retry != 0 || r.member == "" {
+			t.Fatalf("reserve %d: retry=%d err=%v", i, r.retry, r.err)
+		}
+		others = append(others, r.member)
+	}
+	// A completes while B..E remain in flight, before any further reservation.
+	if err := l.Release(ctx, "alice", a); err != nil {
+		t.Fatal(err)
+	}
+	key := prefix + loginFailureKey("alice")
+	if count, err := client.ZCard(ctx, key).Result(); err != nil || count != 4 {
+		t.Fatalf("remaining reservations=%d err=%v, want 4", count, err)
+	}
+	for _, member := range others {
+		if _, err := client.ZScore(ctx, key, member).Result(); err != nil {
+			t.Fatalf("in-flight member %q missing: %v", member, err)
+		}
+	}
+	if _, err := client.ZScore(ctx, key, a).Result(); err != redis.Nil {
+		t.Fatalf("A still present or error: %v", err)
+	}
+	if member, retry, err := l.Reserve(ctx, "alice"); err != nil || retry != 0 || member == "" {
+		t.Fatalf("next reserve: member=%q retry=%d err=%v", member, retry, err)
+	}
+	if member, retry, err := l.Reserve(ctx, "alice"); err != nil || retry <= 0 || member != "" {
+		t.Fatalf("limit: member=%q retry=%d err=%v", member, retry, err)
+	}
 }
 
 func TestRedisRetryAfterAboveLimit(t *testing.T) {
@@ -146,7 +200,7 @@ return 1`, []string{key}).Err()
 	if err != nil {
 		t.Fatal(err)
 	}
-	retry, err := l.Reserve(ctx, "alice")
+	_, retry, err := l.Reserve(ctx, "alice")
 	if err != nil || retry != 6 {
 		t.Fatalf("retry=%d err=%v, want 6", retry, err)
 	}

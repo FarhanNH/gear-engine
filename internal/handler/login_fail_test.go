@@ -15,32 +15,51 @@ import (
 var errLimiter = errors.New("unavailable")
 
 type fakeLoginFailures struct {
-	counts map[string]int
-	fail   string
+	counts       map[string]int
+	fail         string
+	next         int
+	members      map[string]string
+	lastReserved string
+	lastReleased string
+	releaseCalls int
 }
 
-func (f *fakeLoginFailures) Reserve(_ context.Context, user string) (int, error) {
+func (f *fakeLoginFailures) Reserve(_ context.Context, user string) (string, int, error) {
 	if f.fail == "reserve" {
-		return 0, errLimiter
+		return "", 0, errLimiter
 	}
 	key := strings.ToLower(strings.TrimSpace(user))
 	if f.counts[key] >= 5 {
-		return 900, nil
+		return "", 900, nil
 	}
 	f.counts[key]++
-	return 0, nil
+	f.next++
+	member := strconv.Itoa(f.next)
+	if f.members == nil {
+		f.members = map[string]string{}
+	}
+	f.members[member] = key
+	f.lastReserved = member
+	return member, 0, nil
 }
-func (f *fakeLoginFailures) Reset(ctx context.Context, user string) error {
+func (f *fakeLoginFailures) Release(ctx context.Context, user, member string) error {
+	f.releaseCalls++
+	f.lastReleased = member
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if _, ok := ctx.Deadline(); !ok {
-		return errors.New("reset has no deadline")
+		return errors.New("release has no deadline")
 	}
-	if f.fail == "reset" {
+	if f.fail == "release" {
 		return errLimiter
 	}
-	delete(f.counts, strings.ToLower(strings.TrimSpace(user)))
+	key := strings.ToLower(strings.TrimSpace(user))
+	if f.members[member] != key {
+		return errors.New("unknown reservation")
+	}
+	delete(f.members, member)
+	f.counts[key]--
 	return nil
 }
 
@@ -69,7 +88,7 @@ func TestLoginFailureLimitBlocksSixthBeforeTurnstile(t *testing.T) {
 	}
 }
 
-func TestLoginFailureIsolationNormalizationAndReset(t *testing.T) {
+func TestLoginFailureIsolationNormalizationAndRelease(t *testing.T) {
 	db := setupAdminsDB(t)
 	f := &fakeLoginFailures{counts: map[string]int{}}
 	h := handler.NewAuthHandler(db, &mockTokenService{create: func(context.Context, string, time.Duration) (string, int64, error) { return "token", 1, nil }}, time.Hour, nil)
@@ -87,10 +106,11 @@ func TestLoginFailureIsolationNormalizationAndReset(t *testing.T) {
 	if got := request("admin", "correct-password").Code; got != 200 {
 		t.Fatal(got)
 	}
-	for i := 0; i < 5; i++ {
-		if got := request(" AdMiN ", "wrong").Code; got != 401 {
-			t.Fatal(got)
-		}
+	if f.counts["admin"] != 4 || f.releaseCalls != 1 || f.lastReleased != f.lastReserved || f.lastReleased == "" {
+		t.Fatalf("counts=%v calls=%d reserved=%q released=%q", f.counts, f.releaseCalls, f.lastReserved, f.lastReleased)
+	}
+	if got := request(" AdMiN ", "wrong").Code; got != 401 {
+		t.Fatal(got)
 	}
 	if got := request("admin", "wrong").Code; got != 429 {
 		t.Fatal(got)
@@ -114,7 +134,7 @@ func TestLoginFailureUnknownAndExistingHaveSameResponse(t *testing.T) {
 	}
 }
 
-func TestLoginTokenCreateFailureDoesNotReset(t *testing.T) {
+func TestLoginTokenCreateFailureDoesNotRelease(t *testing.T) {
 	db := setupAdminsDB(t)
 	f := &fakeLoginFailures{counts: map[string]int{"admin": 2}}
 	h := handler.NewAuthHandler(db, &mockTokenService{create: func(context.Context, string, time.Duration) (string, int64, error) {
@@ -123,12 +143,12 @@ func TestLoginTokenCreateFailureDoesNotReset(t *testing.T) {
 	h.SetLoginFailureLimiter(f)
 	rr := httptest.NewRecorder()
 	h.Login(rr, newLoginRequest("admin", "correct-password", ""))
-	if rr.Code != http.StatusInternalServerError || f.counts["admin"] < 2 {
+	if rr.Code != http.StatusInternalServerError || f.counts["admin"] != 3 || f.releaseCalls != 0 {
 		t.Fatalf("status=%d counts=%v", rr.Code, f.counts)
 	}
 }
 
-func TestLoginResetAfterClientCancellation(t *testing.T) {
+func TestLoginReleaseAfterClientCancellation(t *testing.T) {
 	db := setupAdminsDB(t)
 	f := &fakeLoginFailures{counts: map[string]int{"admin": 2}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -140,16 +160,16 @@ func TestLoginResetAfterClientCancellation(t *testing.T) {
 	h.SetLoginFailureLimiter(f)
 	rr := httptest.NewRecorder()
 	h.Login(rr, newLoginRequest("admin", "correct-password", "").WithContext(ctx))
-	if rr.Code != http.StatusOK || f.counts["admin"] != 0 {
+	if rr.Code != http.StatusOK || f.counts["admin"] != 2 || f.releaseCalls != 1 || f.lastReleased != f.lastReserved {
 		t.Fatalf("status=%d counts=%v body=%s", rr.Code, f.counts, rr.Body.String())
 	}
 }
 
-func TestLoginResetFailureRevokesAndNeverReturnsToken(t *testing.T) {
+func TestLoginReleaseFailureRevokesAndNeverReturnsToken(t *testing.T) {
 	for _, revokeFails := range []bool{false, true} {
 		t.Run(strconv.FormatBool(revokeFails), func(t *testing.T) {
 			db := setupAdminsDB(t)
-			f := &fakeLoginFailures{counts: map[string]int{}, fail: "reset"}
+			f := &fakeLoginFailures{counts: map[string]int{}, fail: "release"}
 			called := false
 			h := handler.NewAuthHandler(db, &mockTokenService{
 				create: func(context.Context, string, time.Duration) (string, int64, error) { return "secret-token", 42, nil },
@@ -178,7 +198,7 @@ func TestLoginResetFailureRevokesAndNeverReturnsToken(t *testing.T) {
 }
 
 func TestLoginFailureStoreErrorsFailClosed(t *testing.T) {
-	for _, stage := range []string{"reserve", "reset"} {
+	for _, stage := range []string{"reserve", "release"} {
 		t.Run(stage, func(t *testing.T) {
 			db := setupAdminsDB(t)
 			f := &fakeLoginFailures{counts: map[string]int{}, fail: stage}
@@ -188,7 +208,7 @@ func TestLoginFailureStoreErrorsFailClosed(t *testing.T) {
 			}, time.Hour, nil)
 			h.SetLoginFailureLimiter(f)
 			pass := "wrong"
-			if stage == "reset" {
+			if stage == "release" {
 				pass = "correct-password"
 			}
 			rr := httptest.NewRecorder()
