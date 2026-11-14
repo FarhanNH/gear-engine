@@ -106,6 +106,22 @@ func TestLogin_TurnstileInvalidTokenReturns401BeforePasswordCheck(t *testing.T) 
 		t.Fatalf("drop admins: %v", err)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected method POST, got %q", r.Method)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+			t.Errorf("expected form Content-Type, got %q", got)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+		}
+		for key, want := range map[string]string{
+			"secret": "secret", "response": "bad-token", "remoteip": "203.0.113.10",
+		} {
+			if got := r.PostFormValue(key); got != want {
+				t.Errorf("expected form %s %q, got %q", key, want, got)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": false})
 	}))
@@ -178,6 +194,34 @@ func TestLogin_TurnstileErrorOrTimeoutReturns401(t *testing.T) {
 			t.Fatalf("expected 401 on invalid JSON, got %d", rr.Code)
 		}
 	})
+
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var called atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called.Add(1)
+				w.WriteHeader(status)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			}))
+			t.Cleanup(srv.Close)
+
+			verifier := handler.NewTurnstileVerifierWithEndpoint("secret", time.Second, srv.URL)
+			h := handler.NewAuthHandler(db, &mockTokenService{}, time.Hour, verifier)
+			rr := httptest.NewRecorder()
+			h.Login(rr, newLoginRequest("admin", "correct-password", "tok"))
+			if called.Load() != 1 {
+				t.Errorf("expected one siteverify call, got %d", called.Load())
+			}
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 for siteverify status %d, got %d", status, rr.Code)
+			}
+			var resp map[string]string
+			decodeJSON(t, rr.Body, &resp)
+			if resp["error"] != "invalid credentials" {
+				t.Errorf("expected generic 'invalid credentials', got %q", resp["error"])
+			}
+		})
+	}
 }
 
 func TestLogin_TurnstileDisabledSkipsVerification(t *testing.T) {
