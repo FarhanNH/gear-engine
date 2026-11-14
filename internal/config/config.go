@@ -47,6 +47,9 @@ type Config struct {
 	// Env: GEAR_RATE_LIMIT_WINDOW, default: 5m
 	RateLimitWindow time.Duration
 
+	LoginFailMax    int
+	LoginFailWindow time.Duration
+
 	// RedisAddr is the address of the shared Redis instance used for rate limiting.
 	// Env: GEAR_REDIS_ADDR, default: localhost:6379
 	RedisAddr string
@@ -139,6 +142,23 @@ func Load() (*Config, error) {
 	}
 	if cfg.RateLimitWindow < time.Microsecond {
 		return nil, errors.New("GEAR_RATE_LIMIT_WINDOW must be at least 1us")
+	}
+
+	cfg.LoginFailMax = 5
+	if raw := getEnv("GEAR_LOGIN_FAIL_MAX", ""); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 {
+			return nil, errors.New("invalid GEAR_LOGIN_FAIL_MAX: must be a positive integer")
+		}
+		cfg.LoginFailMax = v
+	}
+	cfg.LoginFailWindow = 15 * time.Minute
+	if raw := getEnv("GEAR_LOGIN_FAIL_WINDOW", ""); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < time.Microsecond {
+			return nil, errors.New("invalid GEAR_LOGIN_FAIL_WINDOW: must be a duration of at least 1us")
+		}
+		cfg.LoginFailWindow = d
 	}
 
 	// GEAR_SESSION_TTL — optional duration, default 12h

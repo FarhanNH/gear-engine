@@ -111,6 +111,7 @@ func New(cfg *config.Config) (*Server, error) {
 		turnstile = handler.NewTurnstileVerifier(cfg.TurnstileSecret, cfg.TurnstileTimeout)
 	}
 	authHandler := handler.NewAuthHandler(db, tokenSvc, cfg.SessionTTL, turnstile)
+	authHandler.SetLoginFailureLimiter(middleware.NewRedisLoginFailures(redisClient, cfg.LoginFailMax, cfg.LoginFailWindow))
 	secretHandler := handler.NewSecretHandler(secretSvc)
 	tokenHandler := handler.NewTokenHandler(tokenSvc)
 	policyHandler := handler.NewPolicyHandler(policySvc)
@@ -302,9 +303,10 @@ func pathValidationMiddleware(next http.Handler) http.Handler {
 // Mengembalikan 403 jika tidak diizinkan.
 //
 // HTTP method → action mapping:
-//   GET    → "read"
-//   PUT    → "write"
-//   DELETE → "delete"
+//
+//	GET    → "read"
+//	PUT    → "write"
+//	DELETE → "delete"
 //
 // Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.5
 func (s *Server) policyMiddleware(next http.Handler) http.Handler {

@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gear/engine/internal/crypto"
@@ -15,11 +17,32 @@ import (
 
 // AuthHandler menangani endpoint autentikasi admin.
 type AuthHandler struct {
-	db         *sql.DB
-	tokenSvc   service.TokenService
-	sessionTTL time.Duration
-	turnstile  TurnstileVerifier
-	bcrypt     func(hash, password string) error
+	db            *sql.DB
+	tokenSvc      service.TokenService
+	sessionTTL    time.Duration
+	turnstile     TurnstileVerifier
+	bcrypt        func(hash, password string) error
+	loginFailures LoginFailureLimiter
+}
+
+type LoginFailureLimiter interface {
+	Check(context.Context, string) (int, error)
+	Record(context.Context, string) error
+	Reset(context.Context, string) error
+}
+
+func (h *AuthHandler) SetLoginFailureLimiter(l LoginFailureLimiter) { h.loginFailures = l }
+
+func (h *AuthHandler) loginFailure(w http.ResponseWriter, r *http.Request, username string) {
+	if h.loginFailures != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if h.loginFailures.Record(ctx, username) != nil {
+			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
+			return
+		}
+	}
+	writeAuthError(w)
 }
 
 // NewAuthHandler membuat instance baru AuthHandler.
@@ -65,6 +88,21 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.loginFailures != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		retry, err := h.loginFailures.Check(ctx, req.Username)
+		cancel()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
+			return
+		}
+		if retry > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(retry))
+			writeError(w, http.StatusTooManyRequests, "too many requests")
+			return
+		}
+	}
+
 	// 2. Verifikasi Turnstile sebelum cek password (fail-closed).
 	if h.turnstile != nil {
 		remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -73,7 +111,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		}
 		ok, err := h.turnstile.Verify(r.Context(), req.TurnstileToken, remoteIP)
 		if err != nil || !ok {
-			writeAuthError(w)
+			h.loginFailure(w, r, req.Username)
 			return
 		}
 	}
@@ -88,7 +126,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Username tidak ditemukan — return 401 tanpa detail untuk mencegah user enumeration.
-			writeAuthError(w)
+			h.loginFailure(w, r, req.Username)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal server error")
@@ -98,8 +136,18 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 3. Verifikasi password menggunakan bcrypt.
 	// Return 401 dengan pesan yang sama jika tidak cocok (mencegah timing/enumeration attack).
 	if err := h.bcrypt(passwordHash, req.Password); err != nil {
-		writeAuthError(w)
+		h.loginFailure(w, r, req.Username)
 		return
+	}
+
+	if h.loginFailures != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		err := h.loginFailures.Reset(ctx, req.Username)
+		cancel()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
+			return
+		}
 	}
 
 	// 4. Buat session token.
