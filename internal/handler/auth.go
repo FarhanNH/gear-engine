@@ -15,6 +15,9 @@ import (
 	"github.com/gear/engine/internal/service"
 )
 
+// Cost matches the hashes created by crypto.HashPassword.
+const dummyPasswordHash = "$2a$12$hFfXHQlfSEdTtfNV.aPHBuovhgCD6FhsHUBjJaWmT/CDn/vvvGiii"
+
 // AuthHandler menangani endpoint autentikasi admin.
 type AuthHandler struct {
 	db            *sql.DB
@@ -125,7 +128,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	).Scan(&passwordHash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// Username tidak ditemukan — return 401 tanpa detail untuk mencegah user enumeration.
+			// Match bcrypt work even when the username does not exist.
+			_ = h.bcrypt(dummyPasswordHash, req.Password)
 			h.loginFailure(w, r, req.Username)
 			return
 		}
@@ -134,7 +138,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Verifikasi password menggunakan bcrypt.
-	// Return 401 dengan pesan yang sama jika tidak cocok (mencegah timing/enumeration attack).
+	// Return 401 dengan pesan yang sama jika tidak cocok.
 	if err := h.bcrypt(passwordHash, req.Password); err != nil {
 		h.loginFailure(w, r, req.Username)
 		return
