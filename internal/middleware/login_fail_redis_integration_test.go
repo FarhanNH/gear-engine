@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,7 +35,8 @@ func (r *prefixedTestRedis) Del(ctx context.Context, keys ...string) *redis.IntC
 	return r.UniversalClient.Del(ctx, r.keys(keys)...)
 }
 
-func TestRedisLoginFailuresIntegration(t *testing.T) {
+func testRedisLimiter(t *testing.T, window time.Duration) (*RedisLoginFailures, *redis.Client, string) {
+	t.Helper()
 	addr := os.Getenv("GEAR_TEST_REDIS_ADDR")
 	if addr == "" {
 		t.Skip("GEAR_TEST_REDIS_ADDR not set")
@@ -45,55 +47,110 @@ func TestRedisLoginFailuresIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	prefix := "gear:test:login-fail:" + hex.EncodeToString(nonce[:]) + ":"
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cleanupCancel()
-		if err := client.Del(cleanupCtx, prefix+loginFailureKey("alice"), prefix+loginFailureKey("bob")).Err(); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := client.Del(ctx, prefix+loginFailureKey("alice"), prefix+loginFailureKey("bob")).Err(); err != nil {
 			t.Errorf("cleanup: %v", err)
 		}
 		if err := client.Close(); err != nil {
 			t.Errorf("close: %v", err)
 		}
 	})
-	l := NewRedisLoginFailures(&prefixedTestRedis{UniversalClient: client, prefix: prefix}, 5, 2*time.Second)
-	check := func(user string, blocked bool) {
+	return NewRedisLoginFailures(&prefixedTestRedis{UniversalClient: client, prefix: prefix}, 5, window), client, prefix
+}
+
+func TestParallelLoginReservations(t *testing.T) {
+	l, _, _ := testRedisLimiter(t, time.Minute)
+	var done sync.WaitGroup
+	start := make(chan struct{})
+	type result struct {
+		retry int
+		err   error
+	}
+	results := make(chan result, 20)
+	for i := 0; i < 20; i++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			<-start
+			retry, err := l.Reserve(context.Background(), "alice")
+			results <- result{retry, err}
+		}()
+	}
+	close(start)
+	done.Wait()
+	close(results)
+	allowed, denied := 0, 0
+	for r := range results {
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.retry == 0 {
+			allowed++
+		} else {
+			denied++
+		}
+	}
+	if allowed != 5 || denied != 15 {
+		t.Fatalf("allowed=%d denied=%d", allowed, denied)
+	}
+}
+
+func TestRedisLoginFailuresIntegration(t *testing.T) {
+	l, client, prefix := testRedisLimiter(t, 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	reserve := func(user string, blocked bool) {
 		t.Helper()
-		retry, err := l.Check(ctx, user)
+		retry, err := l.Reserve(ctx, user)
 		if err != nil || (retry > 0) != blocked {
-			t.Fatalf("check %s: retry=%d err=%v, blocked=%v", user, retry, err, blocked)
-		}
-	}
-	record := func(user string) {
-		t.Helper()
-		if err := l.Record(ctx, user); err != nil {
-			t.Fatal(err)
+			t.Fatalf("reserve %s: retry=%d err=%v blocked=%v", user, retry, err, blocked)
 		}
 	}
 	for i := 0; i < 5; i++ {
-		check("alice", false)
-		record("alice")
+		reserve("alice", false)
 	}
-	check("alice", true) // sixth attempt
-	check("bob", false)
+	reserve("alice", true)
 	for i := 0; i < 5; i++ {
-		record("bob")
+		reserve("bob", false)
 	}
-	check("bob", true)
 	if err := l.Reset(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	check("alice", false)
-	check("bob", true)
+	reserve("bob", true)
 	if n, err := client.Exists(ctx, prefix+loginFailureKey("alice")).Result(); err != nil || n != 0 {
 		t.Fatalf("reset key exists=%d err=%v", n, err)
 	}
 	for i := 0; i < 5; i++ {
-		check("alice", false)
-		record("alice")
+		reserve("alice", false)
 	}
-	check("alice", true)
-	time.Sleep(2100 * time.Millisecond)
-	check("alice", false)
+	reserve("alice", true)
+	time.Sleep(400 * time.Millisecond)
+	reserve("alice", false)
+}
+
+func TestRedisRetryAfterAboveLimit(t *testing.T) {
+	l, client, prefix := testRedisLimiter(t, 10*time.Second)
+	ctx := context.Background()
+	key := prefix + loginFailureKey("alice")
+	// Seed seven historic entries; the third-oldest, not the oldest, determines retry.
+	err := client.Eval(ctx, `
+local t = redis.call('TIME')
+local now = tonumber(t[1])*1000000+tonumber(t[2])
+for i, age in ipairs({9, 8, 4, 3, 2, 1, 0}) do
+  redis.call('ZADD', KEYS[1], now-age*1000000, tostring(i))
+end
+redis.call('EXPIRE', KEYS[1], 10)
+return 1`, []string{key}).Err()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := l.Reserve(ctx, "alice")
+	if err != nil || retry != 6 {
+		t.Fatalf("retry=%d err=%v, want 6", retry, err)
+	}
+	if count, err := client.ZCard(ctx, key).Result(); err != nil || count != 7 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
 }

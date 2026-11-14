@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -29,24 +30,11 @@ type AuthHandler struct {
 }
 
 type LoginFailureLimiter interface {
-	Check(context.Context, string) (int, error)
-	Record(context.Context, string) error
+	Reserve(context.Context, string) (int, error)
 	Reset(context.Context, string) error
 }
 
 func (h *AuthHandler) SetLoginFailureLimiter(l LoginFailureLimiter) { h.loginFailures = l }
-
-func (h *AuthHandler) loginFailure(w http.ResponseWriter, r *http.Request, username string) {
-	if h.loginFailures != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if h.loginFailures.Record(ctx, username) != nil {
-			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
-			return
-		}
-	}
-	writeAuthError(w)
-}
 
 // NewAuthHandler membuat instance baru AuthHandler.
 func NewAuthHandler(db *sql.DB, tokenSvc service.TokenService, sessionTTL time.Duration, turnstile TurnstileVerifier) *AuthHandler {
@@ -93,7 +81,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	if h.loginFailures != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		retry, err := h.loginFailures.Check(ctx, req.Username)
+		retry, err := h.loginFailures.Reserve(ctx, req.Username)
 		cancel()
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
@@ -114,7 +102,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		}
 		ok, err := h.turnstile.Verify(r.Context(), req.TurnstileToken, remoteIP)
 		if err != nil || !ok {
-			h.loginFailure(w, r, req.Username)
+			writeAuthError(w)
 			return
 		}
 	}
@@ -130,7 +118,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Match bcrypt work even when the username does not exist.
 			_ = h.bcrypt(dummyPasswordHash, req.Password)
-			h.loginFailure(w, r, req.Username)
+			writeAuthError(w)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal server error")
@@ -140,25 +128,30 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 3. Verifikasi password menggunakan bcrypt.
 	// Return 401 dengan pesan yang sama jika tidak cocok.
 	if err := h.bcrypt(passwordHash, req.Password); err != nil {
-		h.loginFailure(w, r, req.Username)
+		writeAuthError(w)
+		return
+	}
+
+	// 4. Buat session token.
+	plaintext, tokenID, err := h.tokenSvc.Create(r.Context(), "admin-session", h.sessionTTL)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
 	if h.loginFailures != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
 		err := h.loginFailures.Reset(ctx, req.Username)
 		cancel()
 		if err != nil {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+			if err := h.tokenSvc.Revoke(ctx, tokenID); err != nil {
+				log.Printf("ERROR: failed to revoke undisclosed session token id=%d after limiter reset failure", tokenID)
+			}
+			cancel()
 			writeError(w, http.StatusServiceUnavailable, "rate limiter unavailable")
 			return
 		}
-	}
-
-	// 4. Buat session token.
-	plaintext, _, err := h.tokenSvc.Create(r.Context(), "admin-session", h.sessionTTL)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal server error")
-		return
 	}
 
 	// 5. Return token + expires_at.

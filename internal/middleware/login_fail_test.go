@@ -42,22 +42,16 @@ func TestRedisLoginFailuresPassesHashedKeyAndPropagatesErrors(t *testing.T) {
 	f := &fakeRedis{value: 42}
 	l := NewRedisLoginFailures(f, 5, 15*time.Minute)
 	ctx := context.Background()
-	retry, err := l.Check(ctx, " Admin ")
-	if err != nil || retry != 42 || len(f.keys) != 1 || f.keys[0] != loginFailureKey("admin") || f.args[0] != 5 || f.args[1] != (15*time.Minute).Microseconds() {
-		t.Fatalf("check: %d %v keys=%v args=%v", retry, err, f.keys, f.args)
-	}
-	if err := l.Record(ctx, " Admin "); err != nil || f.keys[0] != loginFailureKey("admin") || len(f.args) != 2 {
-		t.Fatalf("record: %v", err)
+	retry, err := l.Reserve(ctx, " Admin ")
+	if err != nil || retry != 42 || len(f.keys) != 1 || f.keys[0] != loginFailureKey("admin") || len(f.args) != 3 || f.args[0] != 5 || f.args[1] != (15*time.Minute).Microseconds() {
+		t.Fatalf("reserve: %d %v keys=%v args=%v", retry, err, f.keys, f.args)
 	}
 	if err := l.Reset(ctx, " Admin "); err != nil || f.keys[0] != loginFailureKey("admin") {
 		t.Fatalf("reset: %v", err)
 	}
 	f.err = errors.New("unavailable")
-	if _, err := l.Check(ctx, "admin"); err == nil {
-		t.Fatal("check ignored error")
-	}
-	if err := l.Record(ctx, "admin"); err == nil {
-		t.Fatal("record ignored error")
+	if _, err := l.Reserve(ctx, "admin"); err == nil {
+		t.Fatal("reserve ignored error")
 	}
 	if err := l.Reset(ctx, "admin"); err == nil {
 		t.Fatal("reset ignored error")
