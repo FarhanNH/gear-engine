@@ -201,7 +201,7 @@ Paket bersama di [`deploy/`](deploy/) berisi Compose, script deployment,
 contoh environment, dan test script. Paket tersebut harus dipasang pada VPS
 sebelum rilis; workflow tidak menyalinnya otomatis. Secrets yang diperlukan:
 `VPS_HOST`, `VPS_PORT`, `VPS_USER`, `VPS_SSH_KEY`, dan `VPS_FINGERPRINT`.
-User VPS juga harus dapat menarik image GHCR private.
+Image `ghcr.io/farhannh/gear-engine` bersifat publik; pull tidak memerlukan login.
 
 Di VPS, `gear-engine` dan `gear-redis` berjalan di Kiri
 (`unix:///run/kiri/docker.sock`), bukan Docker. User VPS (`deploy`) harus
