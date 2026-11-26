@@ -19,9 +19,12 @@ class DeployTest(unittest.TestCase):
         (self.root / ".env").write_text(self.original)
         mock = self.root / "bin"
         mock.mkdir()
-        self.env = dict(os.environ, PATH=f"{mock}:{os.environ['PATH']}", LOG=str(self.root / "calls"))
+        # Start pointed at Docker so the script has to override both settings.
+        self.env = dict(os.environ, PATH=f"{mock}:{os.environ['PATH']}", LOG=str(self.root / "calls"),
+                        DOCKER_HOST="unix:///var/run/docker.sock", DOCKER_CONTEXT="default")
         (mock / "docker").write_text('''#!/usr/bin/env bash
 set -eu
+echo "${DOCKER_HOST-unset}|${DOCKER_CONTEXT-unset}" >> "$LOG.engine"
 echo "${ENGINE_TAG:-baseline}|${UI_TAG:-baseline}|$*" >> "$LOG"
 if [[ "$*" == 'exec gear-redis redis-cli ping' ]]; then echo PONG; fi
 if [[ "$*" == 'exec gear-ui nginx -t' && ${FAIL_VERIFY_ONCE:-0} == 1 && ! -f "$LOG.verify" ]]; then touch "$LOG.verify"; exit 1; fi
@@ -38,8 +41,27 @@ if [[ "$*" == *'https://127.0.0.1:8443/v1/token'* ]]; then printf 401; else prin
             file.chmod(0o755)
 
     def run_deploy(self, service="gear-engine", version="v1.2.3"):
-        return subprocess.run(["bash", str(self.root / "deploy.sh"), service, version],
-                              env=self.env, capture_output=True, text=True)
+        result = subprocess.run(["bash", str(self.root / "deploy.sh"), service, version],
+                                env=self.env, capture_output=True, text=True)
+        self.assert_only_kiri()
+        return result
+
+    def assert_only_kiri(self):
+        log = self.root / "calls.engine"
+        if log.exists():
+            self.assertEqual(set(log.read_text().splitlines()), {"unix:///run/kiri/docker.sock|unset"})
+
+    def test_every_docker_call_uses_kiri_socket(self):
+        # Success covers exec, config, pull, up and ps; v9.9.9 covers rollback.
+        self.assertEqual(self.run_deploy().returncode, 0)
+        self.assertNotEqual(self.run_deploy(version="v9.9.9").returncode, 0)
+        engines = (self.root / "calls.engine").read_text().splitlines()
+        docker_calls = [line for line in (self.root / "calls").read_text().splitlines()
+                        if not line.startswith("curl ")]
+        self.assertGreater(len(docker_calls), 0)
+        self.assertEqual(len(engines), len(docker_calls))
+        for command in ["exec gear-redis", " config ", " pull ", " up ", " ps "]:
+            self.assertTrue(any(command in line for line in docker_calls), command)
 
     def test_engine_success_preserves_ui_and_extra_values(self):
         result = self.run_deploy()
@@ -92,6 +114,7 @@ if [[ "$*" == *'https://127.0.0.1:8443/v1/token'* ]]; then printf 401; else prin
         for process in [first, second]:
             _, stderr = process.communicate(timeout=10)
             self.assertEqual(process.returncode, 0, stderr)
+        self.assert_only_kiri()
         state = (self.root / ".env").read_text()
         self.assertIn("ENGINE_TAG=v2.0.0", state)
         self.assertIn("UI_TAG=v3.0.0", state)

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Gear runs on Kiri: every docker command below must use the Kiri socket.
+unset DOCKER_CONTEXT
+export DOCKER_HOST=unix:///run/kiri/docker.sock
+
 if [[ $# != 2 ]]; then
   echo "Usage: $0 gear-engine|gear-ui vMAJOR.MINOR.PATCH" >&2
   exit 2
