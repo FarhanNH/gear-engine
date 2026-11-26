@@ -203,6 +203,14 @@ sebelum rilis; workflow tidak menyalinnya otomatis. Secrets yang diperlukan:
 `VPS_HOST`, `VPS_PORT`, `VPS_USER`, `VPS_SSH_KEY`, dan `VPS_FINGERPRINT`.
 User VPS juga harus dapat menarik image GHCR private.
 
+Di VPS, `gear-engine` dan `gear-redis` berjalan di Kiri
+(`unix:///run/kiri/docker.sock`), bukan Docker. User VPS (`deploy`) harus
+anggota grup `kiri`. `deploy.sh` memilih socket ini sendiri; untuk perintah
+manual di VPS, pakai
+`env -u DOCKER_CONTEXT DOCKER_HOST=unix:///run/kiri/docker.sock docker ...`
+agar tidak mengenai Docker. Build image di GitHub Actions tetap memakai Docker
+pada runner.
+
 Script mempertahankan tag UI, data engine, dan Redis existing; kegagalan
 startup/smoke check memicu percobaan rollback image. Buat backup database dan
 master key sebelum rilis yang mengubah data; rollback image tidak membatalkan
